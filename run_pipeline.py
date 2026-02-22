@@ -49,7 +49,7 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 # ============================================================
 def build_timeline(anomaly_scores, fps, action_label, action_conf):
     events = []
-    threshold = 0.6
+    threshold = 0.2                        #change to configure threshold to detect anomalies
     active = None
 
     for i, score in enumerate(anomaly_scores):
