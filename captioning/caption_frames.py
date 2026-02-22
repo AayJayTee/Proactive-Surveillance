@@ -21,7 +21,7 @@ class SceneCaptioner:
         self.pegasus_available = False
 
         # ===============================
-        # 1️⃣ GIT
+        # 1️⃣ GIT MODEL
         # ===============================
         print("Loading GIT-large captioning model...")
         self.git_processor = AutoProcessor.from_pretrained("microsoft/git-large-coco")
@@ -32,7 +32,7 @@ class SceneCaptioner:
         print("✓ GIT loaded")
 
         # ===============================
-        # 2️⃣ BLIP
+        # 2️⃣ BLIP MODEL
         # ===============================
         print("Loading BLIP captioning model...")
         self.blip_processor = BlipProcessor.from_pretrained(
@@ -45,7 +45,7 @@ class SceneCaptioner:
         print("✓ BLIP loaded")
 
         # ===============================
-        # 3️⃣ PEGASUS SUMMARIZER (with fallback)
+        # 3️⃣ PEGASUS SUMMARIZER
         # ===============================
         try:
             print("Loading PEGASUS summarizer...")
@@ -57,13 +57,71 @@ class SceneCaptioner:
             self.pegasus_available = True
             print("✓ PEGASUS loaded")
         except Exception as e:
-            print(f"⚠️ PEGASUS failed to load: {e}. Using BLIP summarization fallback.")
+            print(f"⚠️ PEGASUS failed: {e}")
             self.pegasus_available = False
-            self.sum_tokenizer = None
-            self.sum_model = None
 
-    # ...existing code...
+    # =========================================================
+    # 🔥 FRAME CAPTIONING (GIT + BLIP ENSEMBLE)
+    # =========================================================
+    @torch.no_grad()
+    def caption_video_frames(self, frames):
 
+        captions = []
+        generic_phrases = [
+            "all images are copyrighted",
+            "image",
+            "photo",
+            "picture",
+            "no caption"
+        ]
+
+        for frame in frames:
+
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            image = Image.fromarray(rgb)
+
+            # ---- GIT caption ----
+            git_inputs = self.git_processor(
+                images=image,
+                return_tensors="pt"
+            ).to(self.device)
+
+            git_ids = self.git_model.generate(**git_inputs, max_length=40)
+            git_caption = self.git_processor.batch_decode(
+                git_ids,
+                skip_special_tokens=True
+            )[0].strip()
+
+            # ---- BLIP caption ----
+            blip_inputs = self.blip_processor(
+                images=image,
+                return_tensors="pt"
+            ).to(self.device)
+
+            blip_ids = self.blip_model.generate(**blip_inputs)
+            blip_caption = self.blip_processor.decode(
+                blip_ids[0],
+                skip_special_tokens=True
+            ).strip()
+
+            # ---- Decide which caption to keep ----
+            git_clean = git_caption.lower()
+
+            if (
+                len(git_clean.split()) < 4 or
+                any(p in git_clean for p in generic_phrases)
+            ):
+                final_caption = blip_caption
+            else:
+                final_caption = git_caption
+
+            captions.append(final_caption)
+
+        return captions
+
+    # =========================================================
+    # 🧠 SUMMARIZATION
+    # =========================================================
     @torch.no_grad()
     def build_final_caption(
         self,
@@ -75,13 +133,11 @@ class SceneCaptioner:
         if not frame_captions:
             return "No visual description available."
 
-        # Remove duplicates
         unique = list(dict.fromkeys(frame_captions))
-
         text_block = " ".join(unique)
 
-        # Use PEGASUS if available, otherwise use direct captions
-        if self.pegasus_available and self.sum_model is not None:
+        # ---- PEGASUS summarization ----
+        if self.pegasus_available:
             try:
                 inputs = self.sum_tokenizer(
                     text_block,
@@ -102,23 +158,23 @@ class SceneCaptioner:
                     skip_special_tokens=True
                 ).strip()
 
-                # Fallback if summarizer collapses
+                # fallback if bad output
                 if len(summary.split()) < 5:
-                    summary = " ".join(unique)
-            except Exception as e:
-                print(f"⚠️ PEGASUS summarization failed: {e}. Using frame captions directly.")
-                summary = " ".join(unique)
-        else:
-            # Fallback: use frame captions directly
-            summary = " ".join(unique)
+                    summary = text_block
 
+            except Exception:
+                summary = text_block
+        else:
+            summary = text_block
+
+        # ---- Add action ----
         if action_label:
             summary += (
                 f" The recognized activity is {action_label} "
                 f"(confidence {action_confidence:.2f})."
             )
 
-        return summary
+        return summary.strip()
 
 
 def save_captions(data, path):

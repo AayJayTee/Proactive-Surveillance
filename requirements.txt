@@ -34,3 +34,5 @@ accelerate
 # JSON / Logging (standard, but safe)
 # ============================
 ujson
+
+reportlab
