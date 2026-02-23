@@ -42,6 +42,7 @@ ANOMALY_MODEL_PATH = "anomaly_detection/best_anomaly_model.pth"
 OUTPUT_DIR = "output"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+CAPTION_KEYFRAMES = 3  # number of keyframes to extract for captioning (reduce for speed)
 
 
 # ============================================================
@@ -115,11 +116,14 @@ def export_pdf(report_data, path):
 def main(VIDEO_PATH):
 
     # 1️⃣ ACTION
+    print("🔹 Loading Action Recognition Model...")
     action_result = run_action_recognition(
         VIDEO_PATH,
         ACTION_MODEL_PATH
     )
-
+    print(f"   ✅ Action Predicted: {action_result['action']}")
+    print(f"   📊 Confidence: {action_result['confidence']:.4f}")
+    
     # 2️⃣ ANOMALY
     backbone = generate_model(num_classes=101)
     backbone.load_state_dict(torch.load(ACTION_MODEL_PATH, map_location=DEVICE))
@@ -161,7 +165,8 @@ def main(VIDEO_PATH):
         keyframes.append(frame)
     cap.release()
 
-    keyframes = keyframes[::max(len(keyframes)//5, 1)]
+    # downsample frames to a small set of keyframes for captioning
+    keyframes = keyframes[::max(len(keyframes)//CAPTION_KEYFRAMES, 1)]
     frame_captions = captioner.caption_video_frames(keyframes)
 
     final_caption = captioner.build_final_caption(
