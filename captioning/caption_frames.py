@@ -12,6 +12,7 @@ from transformers import (
     BlipProcessor,
     BlipForConditionalGeneration
 )
+import time
 
 
 class SceneCaptioner:
@@ -19,6 +20,8 @@ class SceneCaptioner:
     def __init__(self, device="cuda"):
         self.device = device if torch.cuda.is_available() else "cpu"
         self.pegasus_available = False
+        self.batch_size = 4
+        self.use_fp16 = True if torch.cuda.is_available() else False
 
         # ===============================
         # 1️⃣ GIT MODEL
@@ -65,57 +68,80 @@ class SceneCaptioner:
     # =========================================================
     @torch.no_grad()
     def caption_video_frames(self, frames):
-
         captions = []
         generic_phrases = [
             "all images are copyrighted",
             "image",
             "photo",
             "picture",
-            "no caption"
+            "no caption",
+            "images courtesy of afp",
+            "getty images",
+            "reuters",
+            "epa"
         ]
 
-        for frame in frames:
+        if not frames:
+            return []
 
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            image = Image.fromarray(rgb)
+        # Convert BGR -> RGB PIL once
+        images = [Image.fromarray(cv2.cvtColor(f, cv2.COLOR_BGR2RGB)) for f in frames]
 
-            # ---- GIT caption ----
-            git_inputs = self.git_processor(
-                images=image,
-                return_tensors="pt"
-            ).to(self.device)
+        batch_size = getattr(self, "batch_size", 4) or 4
 
-            git_ids = self.git_model.generate(**git_inputs, max_length=40)
-            git_caption = self.git_processor.batch_decode(
-                git_ids,
-                skip_special_tokens=True
-            )[0].strip()
+        for i in range(0, len(images), batch_size):
+            batch = images[i:i + batch_size]
+            start = time.time()
 
-            # ---- BLIP caption ----
-            blip_inputs = self.blip_processor(
-                images=image,
-                return_tensors="pt"
-            ).to(self.device)
+            # ---- GIT batch caption ----
+            try:
+                git_inputs = self.git_processor(
+                    images=batch,
+                    return_tensors="pt"
+                ).to(self.device)
 
-            blip_ids = self.blip_model.generate(**blip_inputs)
-            blip_caption = self.blip_processor.decode(
-                blip_ids[0],
-                skip_special_tokens=True
-            ).strip()
+                with torch.cuda.amp.autocast(enabled=self.use_fp16 and self.device.startswith("cuda")):
+                    git_ids = self.git_model.generate(**git_inputs, max_length=40, num_beams=1)
 
-            # ---- Decide which caption to keep ----
-            git_clean = git_caption.lower()
+                git_captions = self.git_processor.batch_decode(git_ids, skip_special_tokens=True)
+            except Exception as e:
+                print(f"⚠️ GIT generation failed for batch starting at {i}: {e}")
+                git_captions = [""] * len(batch)
 
-            if (
-                len(git_clean.split()) < 4 or
-                any(p in git_clean for p in generic_phrases)
-            ):
-                final_caption = blip_caption
-            else:
-                final_caption = git_caption
+            # ---- BLIP batch caption ----
+            try:
+                blip_inputs = self.blip_processor(
+                    images=batch,
+                    return_tensors="pt"
+                ).to(self.device)
 
-            captions.append(final_caption)
+                with torch.cuda.amp.autocast(enabled=self.use_fp16 and self.device.startswith("cuda")):
+                    blip_ids = self.blip_model.generate(**blip_inputs, max_length=40)
+
+                blip_captions = [self.blip_processor.decode(x, skip_special_tokens=True).strip() for x in blip_ids]
+            except Exception as e:
+                print(f"⚠️ BLIP generation failed for batch starting at {i}: {e}")
+                blip_captions = [""] * len(batch)
+
+            # ---- Decide per item ----
+            for idx in range(len(batch)):
+                git_caption = git_captions[idx].strip() if idx < len(git_captions) else ""
+                blip_caption = blip_captions[idx].strip() if idx < len(blip_captions) else ""
+
+                git_clean = git_caption.lower()
+
+                if (
+                    len(git_clean.split()) < 4 or
+                    any(p in git_clean for p in generic_phrases)
+                ):
+                    final_caption = blip_caption or git_caption
+                else:
+                    final_caption = git_caption
+
+                captions.append(final_caption)
+
+            duration = time.time() - start
+            print(f"Processed batch {i // batch_size + 1} ({len(batch)} frames) in {duration:.2f}s")
 
         return captions
 
@@ -133,7 +159,26 @@ class SceneCaptioner:
         if not frame_captions:
             return "No visual description available."
 
-        unique = list(dict.fromkeys(frame_captions))
+        # Filter out generic/bad captions before summarization
+        generic_phrases = [
+            "all images are copyrighted",
+            "image",
+            "photo",
+            "picture",
+            "no caption",
+            "images courtesy of afp",
+            "getty images",
+            "reuters",
+            "epa"
+        ]
+        filtered = [
+            c for c in frame_captions
+            if c and not any(p in c.lower() for p in generic_phrases)
+        ]
+        if not filtered:
+            filtered = frame_captions  # fallback if all filtered out
+
+        unique = list(dict.fromkeys(filtered))
         text_block = " ".join(unique)
 
         # ---- PEGASUS summarization ----
